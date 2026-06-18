@@ -1,0 +1,7 @@
+{
+  "name": "innoverseai-chapter-generator",
+  "version": "1.0.0",
+  "dependencies": {
+    "youtube-transcript": "^1.2.1"
+  }
+}
