@@ -1,0 +1,237 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+    background: linear-gradient(135deg, #0a0e27 0%, #1a1a3e 50%, #2d1b69 100%);
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 20px;
+}
+
+.container {
+    max-width: 700px;
+    width: 100%;
+    margin: 0 auto;
+}
+
+header {
+    text-align: center;
+    margin-bottom: 40px;
+}
+
+header h1 {
+    font-size: 48px;
+    font-weight: 800;
+    background: linear-gradient(135deg, #8b5cf6, #06b6d4);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    letter-spacing: -1px;
+}
+
+.tagline {
+    color: rgba(255, 255, 255, 0.5);
+    font-size: 14px;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    margin-top: 5px;
+}
+
+.tool-card {
+    background: rgba(255, 255, 255, 0.05);
+    backdrop-filter: blur(10px);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 20px;
+    padding: 40px;
+    box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+}
+
+.tool-card h2 {
+    color: #fff;
+    font-size: 24px;
+    font-weight: 700;
+    margin-bottom: 8px;
+}
+
+.description {
+    color: rgba(255, 255, 255, 0.6);
+    font-size: 16px;
+    margin-bottom: 30px;
+}
+
+.input-group {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 30px;
+}
+
+.input-group input {
+    flex: 1;
+    padding: 16px 20px;
+    background: rgba(255, 255, 255, 0.08);
+    border: 2px solid rgba(255, 255, 255, 0.1);
+    border-radius: 12px;
+    color: #fff;
+    font-size: 16px;
+    transition: all 0.3s ease;
+}
+
+.input-group input::placeholder {
+    color: rgba(255, 255, 255, 0.3);
+}
+
+.input-group input:focus {
+    outline: none;
+    border-color: #8b5cf6;
+    background: rgba(255, 255, 255, 0.12);
+}
+
+.input-group button {
+    padding: 16px 32px;
+    background: linear-gradient(135deg, #8b5cf6, #06b6d4);
+    border: none;
+    border-radius: 12px;
+    color: #fff;
+    font-size: 16px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    white-space: nowrap;
+}
+
+.input-group button:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 10px 30px rgba(139, 92, 246, 0.4);
+}
+
+.input-group button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    transform: none;
+}
+
+.result-area {
+    background: rgba(0, 0, 0, 0.3);
+    border-radius: 12px;
+    padding: 24px;
+    min-height: 150px;
+}
+
+.placeholder {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    color: rgba(255, 255, 255, 0.2);
+    text-align: center;
+    min-height: 100px;
+}
+
+.placeholder span {
+    font-size: 48px;
+    margin-bottom: 10px;
+}
+
+.chapters-output {
+    color: #e0e0e0;
+    font-family: 'Courier New', monospace;
+    font-size: 15px;
+    line-height: 2;
+    white-space: pre-wrap;
+}
+
+.chapters-output .timestamp {
+    color: #8b5cf6;
+    font-weight: 600;
+}
+
+.loading {
+    text-align: center;
+    padding: 30px 0;
+}
+
+.spinner {
+    display: inline-block;
+    width: 40px;
+    height: 40px;
+    border: 4px solid rgba(139, 92, 246, 0.1);
+    border-top-color: #8b5cf6;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+.loading p {
+    color: rgba(255, 255, 255, 0.4);
+    margin-top: 12px;
+}
+
+.error-message {
+    color: #f87171;
+    background: rgba(248, 113, 113, 0.1);
+    padding: 16px;
+    border-radius: 8px;
+    border: 1px solid rgba(248, 113, 113, 0.2);
+}
+
+footer {
+    text-align: center;
+    margin-top: 30px;
+    color: rgba(255, 255, 255, 0.15);
+    font-size: 13px;
+}
+
+.copy-btn, .download-btn {
+    padding: 10px 20px;
+    border: none;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    color: #fff;
+    margin-right: 10px;
+    margin-top: 10px;
+}
+
+.copy-btn {
+    background: linear-gradient(135deg, #8b5cf6, #7c3aed);
+}
+
+.copy-btn:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 20px rgba(139, 92, 246, 0.4);
+}
+
+.download-btn {
+    background: linear-gradient(135deg, #06b6d4, #0891b2);
+}
+
+.download-btn:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 20px rgba(6, 182, 212, 0.4);
+}
+
+@media (max-width: 600px) {
+    header h1 {
+        font-size: 32px;
+    }
+    .tool-card {
+        padding: 24px;
+    }
+    .input-group {
+        flex-direction: column;
+    }
+    .input-group button {
+        width: 100%;
+    }
+}
