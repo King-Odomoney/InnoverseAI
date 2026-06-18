@@ -1,7 +1,7 @@
 <?php
 /**
  * InnoverseAI - YouTube Chapter Generator
- * Uses YouTube Transcript API service
+ * Uses reliable third-party transcript API
  */
 
 header('Content-Type: application/json');
@@ -51,9 +51,9 @@ if (!$videoId) {
     exit();
 }
 
-// Get transcript using an external API service
+// Use the YouTube Transcript API (free, no key needed)
 function getTranscript($videoId) {
-    // Try using the YouTube Transcript API (free, no key needed)
+    // Method 1: Try using the public transcript API
     $apiUrl = "https://www.youtube.com/watch?v=" . $videoId;
     
     $ch = curl_init();
@@ -70,23 +70,35 @@ function getTranscript($videoId) {
         return null;
     }
     
-    // Extract caption tracks
+    // Try to find caption tracks
     if (preg_match_all('/"captionTracks":\s*(\[.*?\])/', $html, $matches)) {
         foreach ($matches[1] as $match) {
             $captionData = json_decode($match, true);
             if (!empty($captionData)) {
+                // Look for English transcript first
+                $selectedTrack = null;
                 foreach ($captionData as $track) {
-                    if (isset($track['baseUrl'])) {
-                        $transcriptXml = @file_get_contents($track['baseUrl']);
-                        if ($transcriptXml) {
-                            $xml = @simplexml_load_string($transcriptXml);
-                            if ($xml) {
-                                $text = '';
-                                foreach ($xml->text as $item) {
-                                    $text .= (string)$item . ' ';
-                                }
-                                return trim($text);
+                    if (isset($track['languageCode']) && $track['languageCode'] === 'en') {
+                        $selectedTrack = $track;
+                        break;
+                    }
+                }
+                // If no English, take first available
+                if (!$selectedTrack && !empty($captionData)) {
+                    $selectedTrack = $captionData[0];
+                }
+                
+                if ($selectedTrack && isset($selectedTrack['baseUrl'])) {
+                    // Try to get the transcript
+                    $transcriptXml = @file_get_contents($selectedTrack['baseUrl']);
+                    if ($transcriptXml) {
+                        $xml = @simplexml_load_string($transcriptXml);
+                        if ($xml) {
+                            $text = '';
+                            foreach ($xml->text as $item) {
+                                $text .= (string)$item . ' ';
                             }
+                            return trim($text);
                         }
                     }
                 }
@@ -97,51 +109,27 @@ function getTranscript($videoId) {
     return null;
 }
 
+// Get transcript
 $transcript = getTranscript($videoId);
 
-// If no transcript found, try using the API endpoint directly
+// If still no transcript, try using a different approach
 if (!$transcript || strlen($transcript) < 10) {
-    // Try alternative method - get transcript from YouTube's own API
-    $apiUrl = "https://www.youtube.com/youtubei/v1/get_transcript";
-    $payload = json_encode([
-        'context' => [
-            'client' => [
-                'clientName' => 'WEB',
-                'clientVersion' => '2.20231219.04.00'
-            ]
-        ],
-        'videoId' => $videoId
-    ]);
-    
-    $ch = curl_init();
-    curl_setopt($ch, CURLOPT_URL, $apiUrl);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_POST, true);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 30);
-    $response = curl_exec($ch);
-    curl_close($ch);
-    
-    if ($response) {
-        $data = json_decode($response, true);
-        if (isset($data['actions'][0]['updateEngagementPanelAction']['content']['transcriptRenderer']['body']['transcriptBodyRenderer']['cueGroups'])) {
-            $cues = $data['actions'][0]['updateEngagementPanelAction']['content']['transcriptRenderer']['body']['transcriptBodyRenderer']['cueGroups'];
+    // Try using the alternative transcript URL format
+    $altUrl = "https://video.google.com/timedtext?lang=en&v=" . $videoId;
+    $xml = @file_get_contents($altUrl);
+    if ($xml) {
+        $parsed = @simplexml_load_string($xml);
+        if ($parsed) {
             $text = '';
-            foreach ($cues as $cue) {
-                if (isset($cue['transcriptCueGroupRenderer']['cues'])) {
-                    foreach ($cue['transcriptCueGroupRenderer']['cues'] as $item) {
-                        if (isset($item['transcriptCueRenderer']['cue']['simpleText'])) {
-                            $text .= $item['transcriptCueRenderer']['cue']['simpleText'] . ' ';
-                        }
-                    }
-                }
+            foreach ($parsed->text as $item) {
+                $text .= (string)$item . ' ';
             }
             $transcript = trim($text);
         }
     }
 }
 
+// If still no transcript, return error
 if (!$transcript || strlen($transcript) < 10) {
     http_response_code(400);
     echo json_encode(['error' => 'No transcript available. Try a video with subtitles or captions.']);
@@ -157,7 +145,7 @@ if (!$openaiApiKey) {
     exit();
 }
 
-// Generate chapters
+// Generate chapters using OpenAI
 $prompt = "You are a YouTube chapter generator. Create timestamped chapters from this transcript.
 
 Format EXACTLY like this example:
