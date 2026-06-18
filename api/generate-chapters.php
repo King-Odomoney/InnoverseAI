@@ -138,7 +138,7 @@ if (strlen($transcript) < 50) {
     if ($page['code'] === 200 && preg_match('/"captionTracks":(\[.*?\])/', $page['body'], $m)) {
         $tracks = json_decode($m[1], true);
         $track  = null;
-        foreach ($tracks as $t) { if (str_starts_with($t['languageCode'] ?? '', 'en')) { $track = $t; break; } }
+        foreach ($tracks as $t) { if (strpos($t['languageCode'] ?? '', 'en') === 0) { $track = $t; break; } }
         if (!$track) $track = $tracks[0] ?? null;
         if (!empty($track['baseUrl'])) {
             $xml = curlFetch($track['baseUrl']);
