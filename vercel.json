@@ -1,10 +1,8 @@
 {
-  "functions": {
-    "api/*.php": {
-      "runtime": "vercel-php@0.7.1"
-    }
-  },
   "rewrites": [
-    { "source": "/(.*)", "destination": "/public/index.html" }
+    {
+      "source": "/api/get-transcript",
+      "destination": "/api/get-transcript.js"
+    }
   ]
 }
