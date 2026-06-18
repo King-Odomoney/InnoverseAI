@@ -1,7 +1,7 @@
 <?php
 /**
  * InnoverseAI - YouTube Chapter Generator
- * Uses reliable third-party transcript API
+ * Uses YouTube's timedtext API with proper headers + OpenAI for chapters
  */
 
 header('Content-Type: application/json');
@@ -20,8 +20,8 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     exit();
 }
 
-$input = json_decode(file_get_contents('php://input'), true);
-$videoUrl = $input['videoUrl'] ?? '';
+$input    = json_decode(file_get_contents('php://input'), true);
+$videoUrl = trim($input['videoUrl'] ?? '');
 
 if (empty($videoUrl)) {
     http_response_code(400);
@@ -29,185 +29,253 @@ if (empty($videoUrl)) {
     exit();
 }
 
-function extractVideoId($url) {
+// ── 1. Extract video ID ───────────────────────────────────────────────────────
+function extractVideoId(string $url): ?string {
     $patterns = [
-        '/youtube\.com\/watch\?v=([\w-]+)/',
-        '/youtu\.be\/([\w-]+)/',
-        '/youtube\.com\/embed\/([\w-]+)/'
+        '/[?&]v=([\w-]{11})/',
+        '/youtu\.be\/([\w-]{11})/',
+        '/embed\/([\w-]{11})/',
+        '/shorts\/([\w-]{11})/',
     ];
-    foreach ($patterns as $pattern) {
-        if (preg_match($pattern, $url, $matches)) {
-            return $matches[1];
-        }
+    foreach ($patterns as $p) {
+        if (preg_match($p, $url, $m)) return $m[1];
     }
     return null;
 }
 
 $videoId = extractVideoId($videoUrl);
-
 if (!$videoId) {
     http_response_code(400);
-    echo json_encode(['error' => 'Invalid YouTube URL']);
+    echo json_encode(['error' => 'Invalid YouTube URL. Could not extract video ID.']);
     exit();
 }
 
-// Use the YouTube Transcript API (free, no key needed)
-function getTranscript($videoId) {
-    // Method 1: Try using the public transcript API
-    $apiUrl = "https://www.youtube.com/watch?v=" . $videoId;
-    
-    $ch = curl_init();
-    curl_setopt($ch, CURLOPT_URL, $apiUrl);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-    curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 30);
-    $html = curl_exec($ch);
+// ── 2. Fetch transcript ───────────────────────────────────────────────────────
+function curlGet(string $url, array $headers = []): ?string {
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_TIMEOUT        => 20,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_HTTPHEADER     => array_merge([
+            'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept-Language: en-US,en;q=0.9',
+            'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        ], $headers),
+    ]);
+    $result = curl_exec($ch);
     curl_close($ch);
-    
-    if (!$html) {
-        return null;
-    }
-    
-    // Try to find caption tracks
-    if (preg_match_all('/"captionTracks":\s*(\[.*?\])/', $html, $matches)) {
-        foreach ($matches[1] as $match) {
-            $captionData = json_decode($match, true);
-            if (!empty($captionData)) {
-                // Look for English transcript first
-                $selectedTrack = null;
-                foreach ($captionData as $track) {
-                    if (isset($track['languageCode']) && $track['languageCode'] === 'en') {
-                        $selectedTrack = $track;
-                        break;
+    return $result ?: null;
+}
+
+function getTranscriptAndSegments(string $videoId): array {
+    // ── Method A: Parse watch page for captionTracks ──────────────────────────
+    $html = curlGet("https://www.youtube.com/watch?v={$videoId}");
+
+    if ($html) {
+        // Extract the full captions JSON blob
+        if (preg_match('/"captions":\s*\{"playerCaptionsTracklistRenderer":\s*(\{.*?"captionTracks":\s*\[.*?\].*?\})\s*,\s*"audio/', $html, $m1)
+            || preg_match('/"captionTracks":\s*(\[.*?\])\s*,\s*"audioTracks"/', $html, $m2)
+        ) {
+            $raw   = isset($m1[1]) ? $m1[1] : null;
+            $tracks = null;
+
+            if ($raw) {
+                // Pull captionTracks array from the outer object
+                if (preg_match('/"captionTracks":\s*(\[.*?\])\s*,/', $raw, $mx)) {
+                    $tracks = json_decode($mx[1], true);
+                }
+            } elseif (isset($m2[1])) {
+                $tracks = json_decode($m2[1], true);
+            }
+
+            if (!empty($tracks) && is_array($tracks)) {
+                // Priority: English manual → English auto → anything
+                $selected = null;
+                foreach ($tracks as $t) {
+                    if (($t['languageCode'] ?? '') === 'en' && empty($t['kind'])) {
+                        $selected = $t; break;
                     }
                 }
-                // If no English, take first available
-                if (!$selectedTrack && !empty($captionData)) {
-                    $selectedTrack = $captionData[0];
+                if (!$selected) foreach ($tracks as $t) {
+                    if (str_starts_with($t['languageCode'] ?? '', 'en')) {
+                        $selected = $t; break;
+                    }
                 }
-                
-                if ($selectedTrack && isset($selectedTrack['baseUrl'])) {
-                    // Try to get the transcript
-                    $transcriptXml = @file_get_contents($selectedTrack['baseUrl']);
-                    if ($transcriptXml) {
-                        $xml = @simplexml_load_string($transcriptXml);
-                        if ($xml) {
-                            $text = '';
-                            foreach ($xml->text as $item) {
-                                $text .= (string)$item . ' ';
-                            }
-                            return trim($text);
-                        }
+                if (!$selected) $selected = $tracks[0];
+
+                if (!empty($selected['baseUrl'])) {
+                    $xml = curlGet($selected['baseUrl']);
+                    if ($xml) {
+                        return parseTranscriptXml($xml);
                     }
                 }
             }
         }
     }
-    
-    return null;
-}
 
-// Get transcript
-$transcript = getTranscript($videoId);
-
-// If still no transcript, try using a different approach
-if (!$transcript || strlen($transcript) < 10) {
-    // Try using the alternative transcript URL format
-    $altUrl = "https://video.google.com/timedtext?lang=en&v=" . $videoId;
-    $xml = @file_get_contents($altUrl);
-    if ($xml) {
-        $parsed = @simplexml_load_string($xml);
-        if ($parsed) {
-            $text = '';
-            foreach ($parsed->text as $item) {
-                $text .= (string)$item . ' ';
-            }
-            $transcript = trim($text);
+    // ── Method B: Direct timedtext endpoint (older videos) ───────────────────
+    foreach (['en', 'a.en', 'en-US'] as $lang) {
+        $url = "https://video.google.com/timedtext?lang={$lang}&v={$videoId}&fmt=srv3";
+        $xml = curlGet($url);
+        if ($xml && strlen($xml) > 100) {
+            $result = parseTranscriptXml($xml);
+            if (!empty($result['text'])) return $result;
         }
     }
+
+    return ['text' => '', 'segments' => []];
 }
 
-// If still no transcript, return error
-if (!$transcript || strlen($transcript) < 10) {
+function parseTranscriptXml(string $xml): array {
+    // Strip BOM and whitespace
+    $xml = preg_replace('/^\xEF\xBB\xBF/', '', trim($xml));
+
+    $segments = [];
+    $parts    = [];
+
+    // Handle both <text start="..."> and <p t="..."> formats
+    if (preg_match_all('/<text\s+start="([\d.]+)"[^>]*>(.*?)<\/text>/si', $xml, $m)) {
+        foreach ($m[1] as $i => $start) {
+            $text = html_entity_decode(strip_tags($m[2][$i]), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+            $text = preg_replace('/\s+/', ' ', trim($text));
+            if ($text) {
+                $segments[] = ['start' => round((float)$start, 2), 'text' => $text];
+                $parts[]    = $text;
+            }
+        }
+    } elseif (preg_match_all('/<p\s+t="(\d+)"[^>]*>(.*?)<\/p>/si', $xml, $m)) {
+        foreach ($m[1] as $i => $ms) {
+            $text = html_entity_decode(strip_tags($m[2][$i]), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+            $text = preg_replace('/\s+/', ' ', trim($text));
+            if ($text) {
+                $segments[] = ['start' => round((int)$ms / 1000, 2), 'text' => $text];
+                $parts[]    = $text;
+            }
+        }
+    }
+
+    return [
+        'text'     => implode(' ', $parts),
+        'segments' => $segments,
+    ];
+}
+
+$transcriptData = getTranscriptAndSegments($videoId);
+$transcript     = $transcriptData['text'];
+$segments       = $transcriptData['segments'];
+
+if (strlen($transcript) < 50) {
     http_response_code(400);
-    echo json_encode(['error' => 'No transcript available. Try a video with subtitles or captions.']);
+    echo json_encode([
+        'error' => 'No transcript available for this video. This tool works with videos that have subtitles or auto-generated captions enabled.'
+    ]);
     exit();
 }
 
-// Get OpenAI API key
-$openaiApiKey = getenv('OPENAI_API_KEY');
+// ── 3. Build timestamped prompt body ─────────────────────────────────────────
+$promptBody = '';
+if (!empty($segments)) {
+    $sample = array_slice($segments, 0, 220);
+    foreach ($sample as $seg) {
+        $secs = (int)$seg['start'];
+        $h    = intdiv($secs, 3600);
+        $m    = intdiv($secs % 3600, 60);
+        $s    = $secs % 60;
+        $ts   = $h > 0
+            ? sprintf('%d:%02d:%02d', $h, $m, $s)
+            : sprintf('%02d:%02d', $m, $s);
+        $promptBody .= "[{$ts}] {$seg['text']}\n";
+    }
+} else {
+    $promptBody = substr($transcript, 0, 7000);
+}
 
+// ── 4. Generate chapters via OpenAI ──────────────────────────────────────────
+$openaiApiKey = getenv('OPENAI_API_KEY');
 if (!$openaiApiKey) {
     http_response_code(500);
-    echo json_encode(['error' => 'OpenAI API key not configured']);
+    echo json_encode(['error' => 'OPENAI_API_KEY is not set in Vercel environment variables.']);
     exit();
 }
 
-// Generate chapters using OpenAI
-$prompt = "You are a YouTube chapter generator. Create timestamped chapters from this transcript.
+$prompt = <<<PROMPT
+You are a YouTube chapter generator. Analyze the transcript and create 5–8 well-named chapters.
 
-Format EXACTLY like this example:
+FORMAT RULES (strictly follow):
+- Use [MM:SS] for videos under 1 hour, [H:MM:SS] for longer ones
+- First chapter MUST be [00:00]
+- Chapter titles must be descriptive and under 60 characters
+- Return ONLY the formatted chapter list — no intro, no explanation
+
+EXAMPLE:
 [00:00] Introduction
-[02:15] Main Topic 1
-[05:30] Main Topic 2
-[10:45] Conclusion
+[02:30] Setting Up the Environment
+[08:15] Building the Core Feature
+[18:40] Testing and Debugging
+[24:00] Conclusion
 
-Rules:
-- Create 5-8 chapters
-- Make titles descriptive and clickable
-- Return ONLY the chapters, no extra text
+TRANSCRIPT:
+{$promptBody}
+PROMPT;
 
-Transcript: " . substr($transcript, 0, 7000);
-
-$ch = curl_init();
-curl_setopt($ch, CURLOPT_URL, 'https://api.openai.com/v1/chat/completions');
-curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-curl_setopt($ch, CURLOPT_POST, true);
-curl_setopt($ch, CURLOPT_HTTPHEADER, [
-    'Content-Type: application/json',
-    'Authorization: Bearer ' . $openaiApiKey
-]);
-curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode([
-    'model' => 'gpt-3.5-turbo',
-    'messages' => [
-        [
-            'role' => 'system',
-            'content' => 'You are a YouTube chapter generator. Create timestamped chapters from transcripts. Always respond with only the formatted chapters.'
-        ],
-        [
-            'role' => 'user',
-            'content' => $prompt
-        ]
+$ch = curl_init('https://api.openai.com/v1/chat/completions');
+curl_setopt_array($ch, [
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_POST           => true,
+    CURLOPT_HTTPHEADER     => [
+        'Content-Type: application/json',
+        'Authorization: Bearer ' . $openaiApiKey,
     ],
-    'temperature' => 0.3,
-    'max_tokens' => 500
-]));
-curl_setopt($ch, CURLOPT_TIMEOUT, 60);
+    CURLOPT_POSTFIELDS     => json_encode([
+        'model'       => 'gpt-3.5-turbo',
+        'temperature' => 0.3,
+        'max_tokens'  => 600,
+        'messages'    => [
+            [
+                'role'    => 'system',
+                'content' => 'You are a YouTube chapter generator. Return only the formatted chapter list, nothing else.',
+            ],
+            ['role' => 'user', 'content' => $prompt],
+        ],
+    ]),
+    CURLOPT_TIMEOUT        => 60,
+    CURLOPT_SSL_VERIFYPEER => false,
+]);
 
 $response = curl_exec($ch);
 $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
 curl_close($ch);
 
+if ($httpCode === 401) {
+    http_response_code(500);
+    echo json_encode(['error' => 'Invalid OpenAI API key. Check Vercel environment variables.']);
+    exit();
+}
+if ($httpCode === 429) {
+    http_response_code(429);
+    echo json_encode(['error' => 'OpenAI quota exceeded. Check your billing at platform.openai.com.']);
+    exit();
+}
 if ($httpCode !== 200) {
-    http_response_code($httpCode);
-    echo json_encode(['error' => 'OpenAI API error. Please check your API key.']);
+    http_response_code(500);
+    echo json_encode(['error' => "OpenAI returned HTTP {$httpCode}. Check your API key."]);
     exit();
 }
 
-$data = json_decode($response, true);
-$chapters = $data['choices'][0]['message']['content'] ?? '';
+$data     = json_decode($response, true);
+$chapters = trim($data['choices'][0]['message']['content'] ?? '');
 
 if (empty($chapters)) {
     http_response_code(500);
-    echo json_encode(['error' => 'Failed to generate chapters']);
+    echo json_encode(['error' => 'OpenAI returned empty chapters. Please try again.']);
     exit();
 }
 
 echo json_encode([
-    'success' => true,
-    'videoId' => $videoId,
-    'chapters' => $chapters,
-    'wordCount' => str_word_count($transcript)
+    'success'   => true,
+    'videoId'   => $videoId,
+    'chapters'  => $chapters,
+    'wordCount' => str_word_count($transcript),
 ]);
