@@ -1,8 +1,5 @@
 {
   "rewrites": [
-    {
-      "source": "/api/get-transcript",
-      "destination": "/api/get-transcript.js"
-    }
+    { "source": "/api/get-transcript", "destination": "/api/get-transcript.js" }
   ]
 }
