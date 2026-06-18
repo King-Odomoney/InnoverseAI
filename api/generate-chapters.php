@@ -1,7 +1,6 @@
 <?php
 /**
  * InnoverseAI - YouTube Chapter Generator
- * DEBUG VERSION - shows exactly what each method returns
  */
 
 header('Content-Type: application/json');
@@ -12,20 +11,39 @@ header('Access-Control-Allow-Headers: Content-Type, Authorization');
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(200); exit(); }
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     http_response_code(405);
-    echo json_encode(['error' => 'Method not allowed.']);
+    echo json_encode(['error' => 'Method not allowed. Use POST.']);
     exit();
 }
 
-$input    = json_decode(file_get_contents('php://input'), true);
+// ── Read input — works on both Vercel PHP runtime and standard PHP ────────────
+$rawBody = '';
+$stream  = fopen('php://input', 'r');
+if ($stream) {
+    while (!feof($stream)) {
+        $rawBody .= fread($stream, 8192);
+    }
+    fclose($stream);
+}
+
+// Fallback: try $_POST if json body is empty
+$input = json_decode($rawBody, true);
+if (empty($input) && !empty($_POST['videoUrl'])) {
+    $input = $_POST;
+}
+// Last resort: try getallheaders + read again
+if (empty($input)) {
+    $input = json_decode(file_get_contents('php://input'), true);
+}
+
 $videoUrl = trim($input['videoUrl'] ?? '');
-$debug    = $input['debug'] ?? false;
 
 if (empty($videoUrl)) {
     http_response_code(400);
-    echo json_encode(['error' => 'YouTube URL is required']);
+    echo json_encode(['error' => 'YouTube URL is required', 'received' => $rawBody]);
     exit();
 }
 
+// ── 1. Extract Video ID ───────────────────────────────────────────────────────
 function extractVideoId(string $url): ?string {
     $patterns = [
         '/[?&]v=([\w-]{11})/',
@@ -46,128 +64,182 @@ if (!$videoId) {
     exit();
 }
 
-$debugLog = ['videoId' => $videoId];
-
-// ── METHOD 1: Tactiq ──────────────────────────────────────────────────────────
-function tryTactiq(string $videoUrl): array {
-    $ch = curl_init('https://tactiq-apps-prod.tactiq.io/transcript');
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_POST           => true,
-        CURLOPT_HTTPHEADER     => [
-            'Content-Type: application/json',
-            'Origin: https://tactiq.io',
-            'Referer: https://tactiq.io/',
-            'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        ],
-        CURLOPT_POSTFIELDS     => json_encode(['videoUrl' => $videoUrl, 'langCode' => 'en']),
-        CURLOPT_TIMEOUT        => 15,
-        CURLOPT_SSL_VERIFYPEER => false,
-    ]);
-    $response = curl_exec($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $error    = curl_error($ch);
-    curl_close($ch);
-
-    return [
-        'httpCode' => $httpCode,
-        'error'    => $error,
-        'preview'  => substr($response ?? '', 0, 300),
-        'data'     => json_decode($response ?? '', true),
-    ];
-}
-
-// ── METHOD 2: YouTube watch page → captionTracks ─────────────────────────────
-function tryYouTubePage(string $videoId): array {
-    $ch = curl_init("https://www.youtube.com/watch?v={$videoId}");
-    curl_setopt_array($ch, [
+// ── 2. Fetch Transcript ───────────────────────────────────────────────────────
+function curlFetch(string $url, array $opts = []): array {
+    $ch = curl_init($url);
+    curl_setopt_array($ch, array_merge([
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_FOLLOWLOCATION => true,
         CURLOPT_TIMEOUT        => 15,
         CURLOPT_SSL_VERIFYPEER => false,
-        CURLOPT_HTTPHEADER     => [
-            'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        CURLOPT_USERAGENT      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    ], $opts));
+    $body = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err  = curl_error($ch);
+    curl_close($ch);
+    return ['code' => $code, 'body' => $body ?: '', 'error' => $err];
+}
+
+function parseXml(string $xml): array {
+    $segments = []; $parts = [];
+    if (preg_match_all('/<text\s+start="([\d.]+)"[^>]*>(.*?)<\/text>/si', $xml, $m)) {
+        foreach ($m[1] as $i => $start) {
+            $text = html_entity_decode(strip_tags($m[2][$i]), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+            $text = trim(preg_replace('/\s+/', ' ', $text));
+            if ($text) {
+                $segments[] = ['start' => round((float)$start, 2), 'text' => $text];
+                $parts[]    = $text;
+            }
+        }
+    }
+    return empty($parts) ? [] : ['text' => implode(' ', $parts), 'segments' => $segments];
+}
+
+$transcript = '';
+$segments   = [];
+$methodUsed = '';
+
+// Method 1: Tactiq free API
+$tactiq = curlFetch('https://tactiq-apps-prod.tactiq.io/transcript', [
+    CURLOPT_POST       => true,
+    CURLOPT_HTTPHEADER => [
+        'Content-Type: application/json',
+        'Origin: https://tactiq.io',
+        'Referer: https://tactiq.io/',
+    ],
+    CURLOPT_POSTFIELDS => json_encode([
+        'videoUrl' => "https://www.youtube.com/watch?v={$videoId}",
+        'langCode'  => 'en'
+    ]),
+]);
+if ($tactiq['code'] === 200) {
+    $td = json_decode($tactiq['body'], true);
+    if (!empty($td['captions'])) {
+        foreach ($td['captions'] as $cap) {
+            $text = trim($cap['text'] ?? '');
+            if ($text) {
+                $segments[] = ['start' => round(($cap['offset'] ?? 0) / 1000, 2), 'text' => $text];
+            }
+        }
+        $transcript = implode(' ', array_column($segments, 'text'));
+        $methodUsed = 'tactiq';
+    }
+}
+
+// Method 2: YouTube watch page captionTracks
+if (strlen($transcript) < 50) {
+    $page = curlFetch("https://www.youtube.com/watch?v={$videoId}", [
+        CURLOPT_HTTPHEADER => [
             'Accept-Language: en-US,en;q=0.9',
             'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         ],
     ]);
-    $html     = curl_exec($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $error    = curl_error($ch);
-    curl_close($ch);
-
-    $result = ['httpCode' => $httpCode, 'error' => $error, 'htmlLength' => strlen($html ?? '')];
-
-    if ($html && preg_match('/"captionTracks":(\[.*?\])/', $html, $m)) {
+    if ($page['code'] === 200 && preg_match('/"captionTracks":(\[.*?\])/', $page['body'], $m)) {
         $tracks = json_decode($m[1], true);
-        $result['tracksFound'] = count($tracks ?? []);
-        $result['firstTrackUrl'] = $tracks[0]['baseUrl'] ?? 'none';
-        $result['languages'] = array_column($tracks ?? [], 'languageCode');
-
-        // Try fetching the first track
-        if (!empty($tracks[0]['baseUrl'])) {
-            $xmlCh = curl_init($tracks[0]['baseUrl']);
-            curl_setopt_array($xmlCh, [
-                CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_TIMEOUT        => 10,
-                CURLOPT_SSL_VERIFYPEER => false,
-            ]);
-            $xml     = curl_exec($xmlCh);
-            $xmlCode = curl_getinfo($xmlCh, CURLINFO_HTTP_CODE);
-            curl_close($xmlCh);
-            $result['xmlHttpCode'] = $xmlCode;
-            $result['xmlPreview']  = substr($xml ?? '', 0, 200);
+        $track  = null;
+        foreach ($tracks as $t) { if (str_starts_with($t['languageCode'] ?? '', 'en')) { $track = $t; break; } }
+        if (!$track) $track = $tracks[0] ?? null;
+        if (!empty($track['baseUrl'])) {
+            $xml = curlFetch($track['baseUrl']);
+            if ($xml['code'] === 200) {
+                $parsed = parseXml($xml['body']);
+                if (!empty($parsed['text'])) {
+                    $transcript = $parsed['text'];
+                    $segments   = $parsed['segments'];
+                    $methodUsed = 'youtube_page';
+                }
+            }
         }
-    } else {
-        $result['tracksFound'] = 0;
-        $result['hasCaptionKeyword'] = strpos($html ?? '', 'captionTracks') !== false;
-        $result['htmlPreview'] = substr($html ?? '', 0, 200);
     }
-
-    return $result;
 }
 
-// ── METHOD 3: video.google.com timedtext ─────────────────────────────────────
-function tryTimedtext(string $videoId): array {
-    $results = [];
-    foreach (['en', 'a.en'] as $lang) {
-        $url = "https://video.google.com/timedtext?lang={$lang}&v={$videoId}";
-        $ch  = curl_init($url);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT        => 10,
-            CURLOPT_SSL_VERIFYPEER => false,
-            CURLOPT_USERAGENT      => 'Mozilla/5.0',
-        ]);
-        $xml  = curl_exec($ch);
-        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
-        $results[$lang] = ['httpCode' => $code, 'length' => strlen($xml ?? ''), 'preview' => substr($xml ?? '', 0, 200)];
+// Method 3: video.google.com timedtext
+if (strlen($transcript) < 50) {
+    foreach (['en', 'a.en', 'en-US'] as $lang) {
+        $r = curlFetch("https://video.google.com/timedtext?lang={$lang}&v={$videoId}");
+        if ($r['code'] === 200 && strlen($r['body']) > 100) {
+            $parsed = parseXml($r['body']);
+            if (!empty($parsed['text'])) {
+                $transcript = $parsed['text'];
+                $segments   = $parsed['segments'];
+                $methodUsed = "timedtext_{$lang}";
+                break;
+            }
+        }
     }
-    return $results;
 }
 
-// ── METHOD 4: youtubetranscript.com ──────────────────────────────────────────
-function tryYTTranscriptCom(string $videoId): array {
-    $ch = curl_init("https://www.youtubetranscript.com/?server_vid2={$videoId}");
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT        => 10,
-        CURLOPT_SSL_VERIFYPEER => false,
-        CURLOPT_USERAGENT      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-        CURLOPT_HTTPHEADER     => ['Accept: application/json'],
-    ]);
-    $response = curl_exec($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $error    = curl_error($ch);
-    curl_close($ch);
-    return ['httpCode' => $httpCode, 'error' => $error, 'preview' => substr($response ?? '', 0, 300)];
+if (strlen($transcript) < 50) {
+    http_response_code(400);
+    echo json_encode(['error' => 'No transcript available for this video. It must have subtitles or auto-generated captions enabled on YouTube.']);
+    exit();
 }
 
-// Run all methods and return debug info
-$debugLog['method1_tactiq']       = tryTactiq("https://www.youtube.com/watch?v={$videoId}");
-$debugLog['method2_youtubePage']  = tryYouTubePage($videoId);
-$debugLog['method3_timedtext']    = tryTimedtext($videoId);
-$debugLog['method4_ytTranscript'] = tryYTTranscriptCom($videoId);
+// ── 3. Build timestamped prompt ───────────────────────────────────────────────
+$promptBody = '';
+if (!empty($segments)) {
+    foreach (array_slice($segments, 0, 220) as $seg) {
+        $secs = (int)$seg['start'];
+        $h = intdiv($secs, 3600); $m = intdiv($secs % 3600, 60); $s = $secs % 60;
+        $ts = $h > 0 ? sprintf('%d:%02d:%02d', $h, $m, $s) : sprintf('%02d:%02d', $m, $s);
+        $promptBody .= "[{$ts}] {$seg['text']}\n";
+    }
+} else {
+    $promptBody = substr($transcript, 0, 7000);
+}
 
-echo json_encode(['debug' => $debugLog], JSON_PRETTY_PRINT);
+// ── 4. Generate chapters via OpenAI ──────────────────────────────────────────
+$openaiApiKey = getenv('OPENAI_API_KEY');
+if (!$openaiApiKey) {
+    http_response_code(500);
+    echo json_encode(['error' => 'OPENAI_API_KEY not set in Vercel environment variables.']);
+    exit();
+}
+
+$prompt = "You are a YouTube chapter generator. Analyze the transcript and create 5-8 well-named chapters.\n\n"
+    . "FORMAT RULES:\n"
+    . "- Use [MM:SS] for videos under 1 hour, [H:MM:SS] for longer\n"
+    . "- First chapter MUST be [00:00]\n"
+    . "- Titles must be descriptive and under 60 characters\n"
+    . "- Return ONLY the chapter list, no intro, no explanation\n\n"
+    . "TRANSCRIPT:\n{$promptBody}";
+
+$ai = curlFetch('https://api.openai.com/v1/chat/completions', [
+    CURLOPT_POST       => true,
+    CURLOPT_HTTPHEADER => [
+        'Content-Type: application/json',
+        'Authorization: Bearer ' . $openaiApiKey,
+    ],
+    CURLOPT_POSTFIELDS => json_encode([
+        'model'       => 'gpt-3.5-turbo',
+        'temperature' => 0.3,
+        'max_tokens'  => 600,
+        'messages'    => [
+            ['role' => 'system', 'content' => 'You are a YouTube chapter generator. Return only the formatted chapter list.'],
+            ['role' => 'user',   'content' => $prompt],
+        ],
+    ]),
+    CURLOPT_TIMEOUT => 60,
+]);
+
+if ($ai['code'] === 401) { http_response_code(500); echo json_encode(['error' => 'Invalid OpenAI API key.']); exit(); }
+if ($ai['code'] === 429) { http_response_code(429); echo json_encode(['error' => 'OpenAI quota exceeded.']); exit(); }
+if ($ai['code'] !== 200) { http_response_code(500); echo json_encode(['error' => "OpenAI error HTTP {$ai['code']}"]); exit(); }
+
+$aiData   = json_decode($ai['body'], true);
+$chapters = trim($aiData['choices'][0]['message']['content'] ?? '');
+
+if (empty($chapters)) {
+    http_response_code(500);
+    echo json_encode(['error' => 'OpenAI returned empty chapters. Please try again.']);
+    exit();
+}
+
+echo json_encode([
+    'success'   => true,
+    'videoId'   => $videoId,
+    'chapters'  => $chapters,
+    'wordCount' => str_word_count($transcript),
+    'method'    => $methodUsed,
+]);
