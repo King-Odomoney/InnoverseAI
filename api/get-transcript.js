@@ -1,5 +1,6 @@
-// api/get-transcript.js
-// Vercel serverless function — fetches YouTube transcript server-side (no CORS issues)
+// api/get-transcript.js — Vercel serverless function
+
+import { YoutubeTranscript } from 'youtube-transcript';
 
 export default async function handler(req, res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -14,7 +15,23 @@ export default async function handler(req, res) {
         return res.status(400).json({ error: 'Invalid or missing videoId' });
     }
 
-    // ── Helper: fetch with timeout + UA ──────────────────────────────────────
+    // ── Helper: parse YouTube timed-text XML (fallback) ───────────────────────
+    function parseXml(xml) {
+        const segments = [], parts = [];
+        const re = /<text\s+start="([\d.]+)"[^>]*>([\s\S]*?)<\/text>/gi;
+        let m;
+        while ((m = re.exec(xml)) !== null) {
+            const text = m[2]
+                .replace(/<[^>]+>/g, '')
+                .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+                .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+                .replace(/\s+/g, ' ').trim();
+            if (text) { segments.push({ start: parseFloat(m[1]), text }); parts.push(text); }
+        }
+        return parts.length ? { segments, text: parts.join(' ') } : null;
+    }
+
+    // ── Helper: fetch with timeout ────────────────────────────────────────────
     async function get(url, options = {}) {
         const controller = new AbortController();
         const timeout    = setTimeout(() => controller.abort(), 15000);
@@ -36,45 +53,39 @@ export default async function handler(req, res) {
         }
     }
 
-    // ── Helper: parse YouTube timed-text XML ──────────────────────────────────
-    function parseXml(xml) {
-        const segments = [], parts = [];
-        const re = /<text\s+start="([\d.]+)"[^>]*>([\s\S]*?)<\/text>/gi;
-        let m;
-        while ((m = re.exec(xml)) !== null) {
-            const text = m[2]
-                .replace(/<[^>]+>/g, '')
-                .replace(/&amp;/g,  '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-                .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
-                .replace(/\s+/g, ' ').trim();
-            if (text) { segments.push({ start: parseFloat(m[1]), text }); parts.push(text); }
-        }
-        return parts.length ? { segments, text: parts.join(' ') } : null;
-    }
-
     let result = null;
 
-    // ── Method 1: Tactiq free API ─────────────────────────────────────────────
+    // ── Method 1: youtube-transcript npm package (most reliable) ─────────────
     try {
-        const r = await get('https://tactiq-apps-prod.tactiq.io/transcript', {
-            method:  'POST',
-            headers: { 'Content-Type': 'application/json', 'Origin': 'https://tactiq.io', 'Referer': 'https://tactiq.io/' },
-            body:    JSON.stringify({ videoUrl: `https://www.youtube.com/watch?v=${videoId}`, langCode: 'en' }),
-        });
-        if (r.ok) {
-            const d = JSON.parse(r.text);
-            if (d.captions?.length) {
-                const segments = d.captions
-                    .map(c => ({ start: (c.offset || 0) / 1000, text: (c.text || '').trim() }))
-                    .filter(s => s.text);
-                if (segments.length) {
-                    result = { segments, text: segments.map(s => s.text).join(' ') };
-                }
+        const raw = await YoutubeTranscript.fetchTranscript(videoId, { lang: 'en' });
+        if (raw?.length) {
+            const segments = raw.map(s => ({
+                start: s.offset / 1000,
+                text:  s.text.replace(/\s+/g, ' ').trim(),
+            })).filter(s => s.text);
+            if (segments.length) {
+                result = { segments, text: segments.map(s => s.text).join(' ') };
             }
         }
     } catch (_) {}
 
-    // ── Method 2: YouTube watch page → captionTracks ──────────────────────────
+    // ── Method 2: youtube-transcript any language fallback ────────────────────
+    if (!result) {
+        try {
+            const raw = await YoutubeTranscript.fetchTranscript(videoId);
+            if (raw?.length) {
+                const segments = raw.map(s => ({
+                    start: s.offset / 1000,
+                    text:  s.text.replace(/\s+/g, ' ').trim(),
+                })).filter(s => s.text);
+                if (segments.length) {
+                    result = { segments, text: segments.map(s => s.text).join(' ') };
+                }
+            }
+        } catch (_) {}
+    }
+
+    // ── Method 3: YouTube watch page → captionTracks XML ─────────────────────
     if (!result) {
         try {
             const page = await get(`https://www.youtube.com/watch?v=${videoId}`);
@@ -82,7 +93,7 @@ export default async function handler(req, res) {
                 const cm = page.text.match(/"captionTracks":(\[.*?\])/s);
                 if (cm) {
                     const tracks = JSON.parse(cm[1]);
-                    let track = tracks.find(t => (t.languageCode || '').startsWith('en')) || tracks[0];
+                    const track  = tracks.find(t => (t.languageCode || '').startsWith('en')) || tracks[0];
                     if (track?.baseUrl) {
                         const xml = await get(track.baseUrl);
                         if (xml.ok) {
@@ -95,7 +106,27 @@ export default async function handler(req, res) {
         } catch (_) {}
     }
 
-    // ── Method 3: video.google.com timedtext ──────────────────────────────────
+    // ── Method 4: Tactiq free API ─────────────────────────────────────────────
+    if (!result) {
+        try {
+            const r = await get('https://tactiq-apps-prod.tactiq.io/transcript', {
+                method:  'POST',
+                headers: { 'Content-Type': 'application/json', 'Origin': 'https://tactiq.io', 'Referer': 'https://tactiq.io/' },
+                body:    JSON.stringify({ videoUrl: `https://www.youtube.com/watch?v=${videoId}`, langCode: 'en' }),
+            });
+            if (r.ok) {
+                const d = JSON.parse(r.text);
+                if (d.captions?.length) {
+                    const segments = d.captions
+                        .map(c => ({ start: (c.offset || 0) / 1000, text: (c.text || '').trim() }))
+                        .filter(s => s.text);
+                    if (segments.length) result = { segments, text: segments.map(s => s.text).join(' ') };
+                }
+            }
+        } catch (_) {}
+    }
+
+    // ── Method 5: video.google.com timedtext ──────────────────────────────────
     if (!result) {
         for (const lang of ['en', 'a.en', 'en-US']) {
             try {
@@ -106,39 +137,6 @@ export default async function handler(req, res) {
                 }
             } catch (_) {}
         }
-    }
-
-    // ── Method 4: YouTube InnerTube API ───────────────────────────────────────
-    if (!result) {
-        try {
-            const params = Buffer.from('\x0a\x0b' + videoId).toString('base64');
-            const r = await get(
-                'https://www.youtube.com/youtubei/v1/get_transcript?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8',
-                {
-                    method:  'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body:    JSON.stringify({
-                        context: { client: { clientName: 'WEB', clientVersion: '2.20240101' } },
-                        params,
-                    }),
-                }
-            );
-            if (r.ok) {
-                const itd  = JSON.parse(r.text);
-                const cues = itd?.actions?.[0]?.updateEngagementPanelAction?.content
-                              ?.transcriptRenderer?.body?.transcriptBodyRenderer?.cueGroups || [];
-                const segments = [], parts = [];
-                for (const group of cues) {
-                    for (const cue of group?.transcriptCueGroupRenderer?.cues || []) {
-                        const cr   = cue?.transcriptCueRenderer || {};
-                        const ms   = parseInt(cr.startOffsetMs || 0);
-                        const text = (cr.cue?.simpleText || '').trim();
-                        if (text) { segments.push({ start: ms / 1000, text }); parts.push(text); }
-                    }
-                }
-                if (segments.length) result = { segments, text: parts.join(' ') };
-            }
-        } catch (_) {}
     }
 
     // ── Respond ───────────────────────────────────────────────────────────────
